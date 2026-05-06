@@ -79,6 +79,31 @@ class DhanLiveFetcher:
         ds = d.strftime("%Y-%m-%d")
         return self._fetch(from_date=ds, to_date=ds)
 
+    def fetch_last_n_days(self, n: int = 10) -> list[tuple[date, pd.DataFrame]]:
+        """Fetch 1-min data for the last N trading days (including today).
+        Returns list of (date, DataFrame) sorted oldest-first."""
+        from datetime import timedelta
+        results = []
+        today = date.today()
+        # Start from today, go backwards until we have N days with data
+        max_lookback = n * 2 + 10
+        for offset in range(0, max_lookback):
+            d = today - timedelta(days=offset)
+            if d.weekday() >= 5:  # skip Saturday/Sunday
+                continue
+            try:
+                df = self.fetch_date(d)
+                if not df.empty:
+                    results.append((d, df))
+            except Exception:
+                continue
+            if len(results) >= n:
+                break
+            time.sleep(0.4)  # rate limit
+        # Reverse to chronological order (oldest first)
+        results.reverse()
+        return results
+
     def _fetch(self, from_date: str, to_date: str) -> pd.DataFrame:
         """Internal: call Dhan intraday chart API and return DataFrame."""
         payload = {

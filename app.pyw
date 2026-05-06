@@ -131,6 +131,11 @@ class ProfileApp(QMainWindow):
         self.live_sec_id = QLineEdit(DEFAULT_SECURITY_ID)
         self.live_sec_id.setFixedWidth(80)
         live_row1.addWidget(self.live_sec_id)
+        live_row1.addWidget(QLabel("Days"))
+        self.live_n_days = QSpinBox()
+        self.live_n_days.setRange(1, 30)
+        self.live_n_days.setValue(10)
+        live_row1.addWidget(self.live_n_days)
         live_row1.addStretch()
         live_lay.addLayout(live_row1)
         live_row2 = QHBoxLayout()
@@ -340,8 +345,10 @@ class ProfileApp(QMainWindow):
     def _on_live_fetch(self):
         """Fetch live data from Dhan API and draw profile."""
         sec_id = self.live_sec_id.text().strip() or DEFAULT_SECURITY_ID
-        self.live_status.setText("Status: Fetching...")
+        n_days = self.live_n_days.value()
+        self.live_status.setText(f"Status: Fetching {n_days} day(s)...")
         self.live_status.repaint()
+        QApplication.processEvents()
 
         try:
             fetcher = DhanLiveFetcher.from_credentials_file(security_id=sec_id)
@@ -354,36 +361,71 @@ class ProfileApp(QMainWindow):
                 self.live_status.setText("Status: No credentials")
                 return
 
-            df = fetcher.fetch_today()
-            if df.empty:
-                self.live_status.setText("Status: No data (market closed?)")
-                return
-
-            # Compute profile
             tick = self._tick_size
             bin_sz = self._bin_size
             period = PERIOD_OPTIONS[self._period_text]
             va = self._va_pct
             ib_min = self._ib_minutes
-
             from engine import SESSION_START, SESSION_END
-            t = df["timestamp"].dt.time
-            df = df[(t >= SESSION_START) & (t <= SESSION_END)].copy()
-            if df.empty:
-                self.live_status.setText("Status: No data in session hours")
-                return
 
-            result = compute_profile(df, tick_size=tick, period_minutes=period,
-                                     value_area_pct=va, title="LIVE — Nifty Futures",
-                                     ib_minutes=ib_min)
+            if n_days == 1:
+                # Single day — today only
+                df = fetcher.fetch_today()
+                if df.empty:
+                    self.live_status.setText("Status: No data (market closed?)")
+                    return
+                t = df["timestamp"].dt.time
+                df = df[(t >= SESSION_START) & (t <= SESSION_END)].copy()
+                if df.empty:
+                    self.live_status.setText("Status: No data in session hours")
+                    return
 
-            style_merged = self._style_text == "Merged"
-            view_mode = "merged" if style_merged else "expanded"
+                result = compute_profile(df, tick_size=tick, period_minutes=period,
+                                         value_area_pct=va, title="LIVE — Nifty Futures",
+                                         ib_minutes=ib_min)
+                all_dfs = [df]
+                style_merged = self._style_text == "Merged"
+                view_mode = "merged" if style_merged else "expanded"
+                total_bars = len(df)
+            else:
+                # Multi-day continuous
+                day_data = fetcher.fetch_last_n_days(n_days)
+                if not day_data:
+                    self.live_status.setText("Status: No data found")
+                    return
+
+                daily_profiles = []
+                all_dfs = []
+                for d, df in day_data:
+                    t = df["timestamp"].dt.time
+                    df = df[(t >= SESSION_START) & (t <= SESSION_END)].copy()
+                    if df.empty:
+                        continue
+                    all_dfs.append(df)
+                    daily_profiles.append(compute_profile(
+                        df, tick_size=tick, period_minutes=period,
+                        value_area_pct=va, title=d.strftime("%d-%b"),
+                        ib_minutes=ib_min))
+
+                if not daily_profiles:
+                    self.live_status.setText("Status: No data in session hours")
+                    return
+
+                first_d = day_data[0][0].strftime("%d-%b")
+                last_d = day_data[-1][0].strftime("%d-%b")
+                title = f"LIVE — {len(daily_profiles)} days ({first_d} → {last_d})"
+                result = compute_composite(daily_profiles, value_area_pct=va,
+                                           tick_size=tick, title=title)
+                view_mode = "continuous"
+                total_bars = sum(len(df) for df in all_dfs)
+
             metric = "minute" if self._metric_text.startswith("Minute") else "tpo"
+            style_merged = self._style_text == "Merged"
 
             candle_df = None
-            if self._show_candle:
-                candle_df = self._resample_candles(df.copy())
+            if self._show_candle and all_dfs:
+                candle_df = pd.concat(all_dfs, ignore_index=True).sort_values("timestamp")
+                candle_df = self._resample_candles(candle_df)
 
             self.chart.render(result, bin_sz, candle_df=candle_df,
                               show_letters=self._show_letters,
@@ -393,8 +435,7 @@ class ProfileApp(QMainWindow):
                               ib_minutes=ib_min)
 
             now = datetime.now().strftime("%H:%M:%S")
-            n_bars = len(df)
-            self.live_status.setText(f"Status: OK — {n_bars} bars @ {now}")
+            self.live_status.setText(f"Status: OK — {total_bars} bars @ {now}")
             self.statusBar().showMessage(f"Live: {result.title} | POC={result.poc:.2f}")
 
             # Start auto-refresh if enabled
