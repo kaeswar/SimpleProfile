@@ -146,8 +146,14 @@ const PR={
         x.setTransform(dpr,0,0,dpr,0,0);
         x.fillStyle='#131722';x.fillRect(0,0,W,H);
         if(!this.data)return;
+        // Clip to plot area so lines/labels don't bleed into margins
+        x.save();
+        x.beginPath();
+        x.rect(this.ml,this.mt,W-this.ml-this.mr,H-this.mt-this.mb);
+        x.clip();
         this._grid(W,H);this._va(W,H);this._cells(W,H);
         this._seps(W,H);this._klines(W,H);this._markers(W,H);this._counts(W,H);
+        x.restore();
         this._axes(W,H);this._cross(W,H);this._title(W,H);
     },
 

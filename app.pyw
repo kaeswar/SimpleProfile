@@ -7,9 +7,10 @@ from __future__ import annotations
 import sys
 import os
 from dataclasses import replace
+from datetime import datetime
 
 import pandas as pd
-from PySide6.QtCore import Qt, QDate
+from PySide6.QtCore import Qt, QDate, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QLineEdit, QFileDialog, QComboBox, QDoubleSpinBox, QSpinBox,
@@ -23,6 +24,7 @@ from engine import (
     compute_profile, list_csv_files, load_csv, minute_key_levels,
 )
 from chart_unified import UnifiedChart
+from dhan_live import DhanLiveFetcher, DEFAULT_SECURITY_ID
 
 DEFAULT_FOLDER = r"D:\Learning\Python\KD_Fetcher\data\NIFTY-Apr2026-FUT"
 
@@ -75,10 +77,11 @@ class ProfileApp(QMainWindow):
         self.mode_multi = QRadioButton("Composite — multi-select")
         self.mode_continuous = QRadioButton("Continuous (last N days)")
         self.mode_weekly = QRadioButton("Continuous Weekly (last N weeks)")
+        self.mode_live = QRadioButton("Live (Dhan API)")
         self.mode_single.setChecked(True)
         grp = QButtonGroup(self)
         for r in (self.mode_single, self.mode_range, self.mode_multi,
-                  self.mode_continuous, self.mode_weekly):
+                  self.mode_continuous, self.mode_weekly, self.mode_live):
             grp.addButton(r); ml.addWidget(r)
             r.toggled.connect(self._sync_mode)
         lay.addWidget(mbox)
@@ -119,6 +122,40 @@ class ProfileApp(QMainWindow):
         weekly_row2.addWidget(self.weekly_anchor_date)
         weekly_lay.addLayout(weekly_row2)
         lay.addWidget(self.weekly_box)
+
+        # Live controls
+        self.live_box = QGroupBox("Live Settings")
+        live_lay = QVBoxLayout(self.live_box)
+        live_row1 = QHBoxLayout()
+        live_row1.addWidget(QLabel("Security ID"))
+        self.live_sec_id = QLineEdit(DEFAULT_SECURITY_ID)
+        self.live_sec_id.setFixedWidth(80)
+        live_row1.addWidget(self.live_sec_id)
+        live_row1.addWidget(QLabel("Days"))
+        self.live_n_days = QSpinBox()
+        self.live_n_days.setRange(1, 30)
+        self.live_n_days.setValue(10)
+        live_row1.addWidget(self.live_n_days)
+        live_row1.addStretch()
+        live_lay.addLayout(live_row1)
+        live_row2 = QHBoxLayout()
+        self.live_auto_cb = QCheckBox("Auto-refresh (3 min)")
+        self.live_auto_cb.setChecked(True)
+        self.live_auto_cb.toggled.connect(self._toggle_live_timer)
+        live_row2.addWidget(self.live_auto_cb)
+        self.live_fetch_btn = QPushButton("Fetch Now")
+        self.live_fetch_btn.clicked.connect(self._on_live_fetch)
+        live_row2.addWidget(self.live_fetch_btn)
+        live_lay.addLayout(live_row2)
+        self.live_status = QLabel("Status: Idle")
+        self.live_status.setStyleSheet("color: #888; font-size: 10px;")
+        live_lay.addWidget(self.live_status)
+        lay.addWidget(self.live_box)
+
+        # Live timer
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(3 * 60 * 1000)  # 3 minutes
+        self._live_timer.timeout.connect(self._on_live_fetch)
 
         # Date range
         self.range_box = QGroupBox("Date Range")
@@ -187,13 +224,19 @@ class ProfileApp(QMainWindow):
         is_cont = self.mode_continuous.isChecked()
         is_weekly = self.mode_weekly.isChecked()
         is_range = self.mode_range.isChecked()
+        is_live = self.mode_live.isChecked()
         self.range_box.setVisible(is_range)
         self.cont_box.setVisible(is_cont)
         self.weekly_box.setVisible(is_weekly)
-        self.list_box.setVisible(not is_range and not is_cont and not is_weekly)
+        self.live_box.setVisible(is_live)
+        self.list_box.setVisible(not is_range and not is_cont and not is_weekly and not is_live)
         self.day_list.setSelectionMode(
             QListWidget.MultiSelection if self.mode_multi.isChecked() else QListWidget.SingleSelection
         )
+        # Stop live timer if switching away from live mode
+        if not is_live and self._live_timer.isActive():
+            self._live_timer.stop()
+            self.live_status.setText("Status: Stopped")
 
     def _resample_candles(self, df: pd.DataFrame) -> pd.DataFrame:
         """Resample 1-min OHLCV data to the selected candlestick timeframe."""
@@ -291,6 +334,118 @@ class ProfileApp(QMainWindow):
         return weeks
 
     # ---------- Draw ----------
+    def _toggle_live_timer(self, checked: bool):
+        if checked and self.mode_live.isChecked():
+            self._live_timer.start()
+            self.live_status.setText("Status: Auto-refresh ON (every 3 min)")
+        else:
+            self._live_timer.stop()
+            self.live_status.setText("Status: Auto-refresh OFF")
+
+    def _on_live_fetch(self):
+        """Fetch live data from Dhan API and draw profile."""
+        sec_id = self.live_sec_id.text().strip() or DEFAULT_SECURITY_ID
+        n_days = self.live_n_days.value()
+        self.live_status.setText(f"Status: Fetching {n_days} day(s)...")
+        self.live_status.repaint()
+        QApplication.processEvents()
+
+        try:
+            fetcher = DhanLiveFetcher.from_credentials_file(security_id=sec_id)
+            if not fetcher.is_configured():
+                QMessageBox.warning(self, "Credentials Missing",
+                    "credentials.txt not found or incomplete.\n"
+                    "Create a file 'credentials.txt' in the app folder with:\n"
+                    "  client_id=YOUR_CLIENT_ID\n"
+                    "  access_token=YOUR_ACCESS_TOKEN")
+                self.live_status.setText("Status: No credentials")
+                return
+
+            tick = self._tick_size
+            bin_sz = self._bin_size
+            period = PERIOD_OPTIONS[self._period_text]
+            va = self._va_pct
+            ib_min = self._ib_minutes
+            from engine import SESSION_START, SESSION_END
+
+            if n_days == 1:
+                # Single day — today only
+                df = fetcher.fetch_today()
+                if df.empty:
+                    self.live_status.setText("Status: No data (market closed?)")
+                    return
+                t = df["timestamp"].dt.time
+                df = df[(t >= SESSION_START) & (t <= SESSION_END)].copy()
+                if df.empty:
+                    self.live_status.setText("Status: No data in session hours")
+                    return
+
+                result = compute_profile(df, tick_size=tick, period_minutes=period,
+                                         value_area_pct=va, title="LIVE — Nifty Futures",
+                                         ib_minutes=ib_min)
+                all_dfs = [df]
+                style_merged = self._style_text == "Merged"
+                view_mode = "merged" if style_merged else "expanded"
+                total_bars = len(df)
+            else:
+                # Multi-day continuous
+                day_data = fetcher.fetch_last_n_days(n_days)
+                if not day_data:
+                    self.live_status.setText("Status: No data found")
+                    return
+
+                daily_profiles = []
+                all_dfs = []
+                for d, df in day_data:
+                    t = df["timestamp"].dt.time
+                    df = df[(t >= SESSION_START) & (t <= SESSION_END)].copy()
+                    if df.empty:
+                        continue
+                    all_dfs.append(df)
+                    daily_profiles.append(compute_profile(
+                        df, tick_size=tick, period_minutes=period,
+                        value_area_pct=va, title=d.strftime("%d-%b"),
+                        ib_minutes=ib_min))
+
+                if not daily_profiles:
+                    self.live_status.setText("Status: No data in session hours")
+                    return
+
+                first_d = day_data[0][0].strftime("%d-%b")
+                last_d = day_data[-1][0].strftime("%d-%b")
+                title = f"LIVE — {len(daily_profiles)} days ({first_d} → {last_d})"
+                result = compute_composite(daily_profiles, value_area_pct=va,
+                                           tick_size=tick, title=title)
+                view_mode = "continuous"
+                total_bars = sum(len(df) for df in all_dfs)
+
+            metric = "minute" if self._metric_text.startswith("Minute") else "tpo"
+            style_merged = self._style_text == "Merged"
+
+            candle_df = None
+            if self._show_candle and all_dfs:
+                candle_df = pd.concat(all_dfs, ignore_index=True).sort_values("timestamp")
+                candle_df = self._resample_candles(candle_df)
+
+            self.chart.render(result, bin_sz, candle_df=candle_df,
+                              show_letters=self._show_letters,
+                              view_mode=view_mode, count_metric=metric,
+                              style="merged" if style_merged else "expanded",
+                              visibility=self._visibility,
+                              ib_minutes=ib_min)
+
+            now = datetime.now().strftime("%H:%M:%S")
+            self.live_status.setText(f"Status: OK — {total_bars} bars @ {now}")
+            self.statusBar().showMessage(f"Live: {result.title} | POC={result.poc:.2f}")
+
+            # Start auto-refresh if enabled
+            if self.live_auto_cb.isChecked() and not self._live_timer.isActive():
+                self._live_timer.start()
+
+        except Exception as e:
+            self.live_status.setText(f"Status: Error — {str(e)[:60]}")
+            QMessageBox.critical(self, "Live Fetch Error", str(e))
+
     def _on_about(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("About — Simple Profile")
@@ -461,6 +616,9 @@ class ProfileApp(QMainWindow):
                 self._visibility[key] = cb.isChecked()
 
     def _on_draw(self):
+        if self.mode_live.isChecked():
+            self._on_live_fetch()
+            return
         is_weekly = self.mode_weekly.isChecked()
         is_continuous = self.mode_continuous.isChecked()
         is_single = self.mode_single.isChecked()
