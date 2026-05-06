@@ -126,7 +126,7 @@ This software is provided **as-is**. It may contain errors and is **not perfect*
 
 ## Credits
 
-- **Developed with [Claude Code](https://claude.ai)** (Anthropic AI) — the entire codebase was written and iterated through AI-assisted development.
+- **Developed with [Claude Code](https://claude.ai)** (Anthropic AI) — the entire codebase was written and iterated through AI-assisted development. Mostly Opus 4.6 + Sonnet 4.6 
 - This phase of development was driven by the need and desire of **Kaeswar** — kaeswar@gmail.com
 
 ---
